@@ -241,7 +241,7 @@ jobs:
           dest=$(cat "$GITHUB_WORKSPACE/kconfig.dest")
           ok=0
           for i in $(seq 1 300); do
-            if make -j"$(nproc)" target/linux/compile > "$GITHUB_WORKSPACE/kcompile.log" 2>&1; then
+            if make -j"$(nproc)" V=s target/linux/compile > "$GITHUB_WORKSPACE/kcompile.log" 2>&1; then
               ok=1; echo "Kernel selesai dikompilasi (percobaan ke-$i)"; break
             fi
             if python3 "$GITHUB_WORKSPACE/resolve_new.py" "$GITHUB_WORKSPACE/kcompile.log" "$dest"; then
