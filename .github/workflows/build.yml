@@ -9,7 +9,8 @@
 #
 # Hasil (Artifacts):
 #   - openwrt-image      : *-combined-efi.img.gz (tulis ke flashdisk/SD)
-#   - verify-report      : daftar simbol kernel yang berhasil/gagal aktif
+#   - verify-report      : daftar simbol kernel yang berhasil/gagal aktif,
+#                          log kernel_oldconfig, dan config kernel hasil resolusi
 #   - packages-feed      : paket + kmod hasil build (feed sendiri)
 # =============================================================================
 name: Build OpenWrt armsr HG680P
@@ -61,6 +62,13 @@ jobs:
           path: openwrt/dl
           key: dl-${{ inputs.openwrt_ref }}-${{ github.run_id }}
           restore-keys: dl-${{ inputs.openwrt_ref }}-
+
+      - name: Cache ccache (mempercepat build ulang)
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.openwrt_ref }}-${{ github.run_id }}
+          restore-keys: ccache-${{ inputs.openwrt_ref }}-
 
       - name: Update dan install feeds
         working-directory: openwrt
@@ -160,6 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > .config <<'EOF'
+          CONFIG_CCACHE=y
           CONFIG_TARGET_armsr=y
           CONFIG_TARGET_armsr_armv8=y
           CONFIG_TARGET_armsr_armv8_DEVICE_generic=y
@@ -186,7 +195,31 @@ jobs:
         working-directory: openwrt
         run: make download -j8
 
-      - name: Build
+      - name: Build tools + toolchain
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" tools/install toolchain/install || { make -j1 V=s tools/install toolchain/install 2>&1 | tail -n 300; exit 1; }
+
+      - name: Resolusi simbol kernel BARU (otomatis ambil nilai default)
+        working-directory: openwrt
+        run: |
+          # Mengaktifkan ARCH_MESON memunculkan puluhan simbol baru yang harus
+          # punya nilai. kernel_oldconfig resmi OpenWrt menjawab semua prompt
+          # dengan default (Enter) lalu menulis hasilnya ke config-<versi> armsr.
+          set +e
+          yes '' | make kernel_oldconfig CONFIG_TARGET=subtarget > "$GITHUB_WORKSPACE/oldconfig.log" 2>&1
+          rc=${PIPESTATUS[1]}
+          set -e
+          tail -n 40 "$GITHUB_WORKSPACE/oldconfig.log"
+          [ "$rc" -eq 0 ] || { echo "kernel_oldconfig gagal (kode $rc)"; exit 1; }
+          ls -l target/linux/armsr/armv8/config-* target/linux/armsr/config-* 2>/dev/null || true
+
+      - name: Kompilasi kernel
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" target/linux/compile || { make -j1 V=s target/linux/compile 2>&1 | tail -n 300; exit 1; }
+
+      - name: Build penuh
         working-directory: openwrt
         run: |
           make -j"$(nproc)" || { make -j1 V=s 2>&1 | tail -n 300; exit 1; }
@@ -232,6 +265,9 @@ jobs:
           path: |
             verify-report.txt
             kernel-final.config
+            oldconfig.log
+            openwrt/target/linux/armsr/armv8/config-*
+            openwrt/target/linux/armsr/config-*
 
       - name: Upload feed paket (kmod + paket)
         if: success()
@@ -242,3 +278,4 @@ jobs:
           path: |
             openwrt/bin/packages
             openwrt/bin/targets/armsr/armv8/packages
+            
