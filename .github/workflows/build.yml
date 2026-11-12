@@ -56,15 +56,15 @@ jobs:
         run: |
           git clone --depth 1 --branch "$OPENWRT_REF" https://github.com/openwrt/openwrt.git openwrt
 
-      - name: Cache dl/
-        uses: actions/cache@v4
+      - name: Restore cache dl/
+        uses: actions/cache/restore@v4
         with:
           path: openwrt/dl
           key: dl-${{ inputs.openwrt_ref }}-${{ github.run_id }}
           restore-keys: dl-${{ inputs.openwrt_ref }}-
 
-      - name: Cache ccache (mempercepat build ulang)
-        uses: actions/cache@v4
+      - name: Restore cache ccache
+        uses: actions/cache/restore@v4
         with:
           path: openwrt/.ccache
           key: ccache-${{ inputs.openwrt_ref }}-${{ github.run_id }}
@@ -91,7 +91,6 @@ jobs:
           CONFIG_RESET_MESON=y
           CONFIG_MESON_SM=y
           CONFIG_MESON_GX_SOCINFO=y
-          CONFIG_MESON_GX_PM_DOMAINS=y
           CONFIG_MESON_IRQ_GPIO=y
           # ---- Serial (konsol UART) ----
           CONFIG_SERIAL_MESON=y
@@ -114,7 +113,6 @@ jobs:
           CONFIG_USB_DWC3=y
           CONFIG_USB_DWC3_MESON_G12A=y
           CONFIG_PHY_MESON_GXL_USB2=y
-          CONFIG_PHY_MESON_GXL_USB3=y
           CONFIG_USB_STORAGE=y
           CONFIG_USB_UAS=y
           CONFIG_SCSI=y
@@ -130,9 +128,6 @@ jobs:
           CONFIG_HW_RANDOM_MESON=y
           CONFIG_MESON_GXBB_WATCHDOG=y
           CONFIG_RTC_DRV_MESON_VRTC=y
-          # ---- Konsol default ke UART Amlogic (digabung dengan argumen GRUB) ----
-          CONFIG_CMDLINE="console=ttyAML0,115200n8 earlycon=meson,0xc81004c0"
-          CONFIG_CMDLINE_EXTEND=y
           EOF
           cat "$GITHUB_WORKSPACE/kernel.fragment"
 
@@ -162,6 +157,7 @@ jobs:
             done
           done < "$frag"
           grep -E '^CONFIG_' "$frag" >> "$dest"
+          echo "$dest" > "$GITHUB_WORKSPACE/kconfig.dest"
 
       - name: Config OpenWrt (target + paket)
         working-directory: openwrt
@@ -169,6 +165,7 @@ jobs:
           set -euo pipefail
           cat > .config <<'EOF'
           CONFIG_CCACHE=y
+          CONFIG_GRUB_BOOTOPTS="console=ttyAML0,115200n8 earlycon=meson,0xc81004c0"
           CONFIG_TARGET_armsr=y
           CONFIG_TARGET_armsr_armv8=y
           CONFIG_TARGET_armsr_armv8_DEVICE_generic=y
@@ -190,6 +187,7 @@ jobs:
           if [ "$ALL_KMODS" = "true" ]; then echo "CONFIG_ALL_KMODS=y" >> .config; fi
           make defconfig
           grep -E '^CONFIG_TARGET_armsr' .config
+          grep -E '^CONFIG_GRUB' .config || echo 'CATATAN: opsi GRUB_BOOTOPTS tidak berlaku di target ini'
 
       - name: Download source
         working-directory: openwrt
@@ -214,10 +212,47 @@ jobs:
           [ "$rc" -eq 0 ] || { echo "kernel_oldconfig gagal (kode $rc)"; exit 1; }
           ls -l target/linux/armsr/armv8/config-* target/linux/armsr/config-* 2>/dev/null || true
 
-      - name: Kompilasi kernel
+      - name: Kompilasi kernel (otomatis isi simbol baru yang tersisa)
         working-directory: openwrt
         run: |
-          make -j"$(nproc)" target/linux/compile || { make -j1 V=s target/linux/compile 2>&1 | tail -n 300; exit 1; }
+          cat > "$GITHUB_WORKSPACE/resolve_new.py" <<'PYEOF'
+          import re, sys
+          log, dest = sys.argv[1], sys.argv[2]
+          text = open(log, errors="replace").read()
+          ms = list(re.finditer(r"\(([A-Z0-9_]+)\)\s*\[([^\]]*)\]\s*\(NEW\)", text))
+          if not ms:
+              sys.exit(1)
+          sym, br = ms[-1].group(1), ms[-1].group(2).strip()
+          cur = open(dest).read()
+          if re.search(r"^(CONFIG_%s=|# CONFIG_%s is not set)" % (sym, sym), cur, re.M):
+              print("Simbol %s sudah ada tapi tetap diminta ulang" % sym)
+              sys.exit(2)
+          if "/" in br:
+              up = [t for t in br.split("/") if t.isupper()]
+              line = "CONFIG_%s=y" % sym if up and up[0] == "Y" else "# CONFIG_%s is not set" % sym
+          elif re.fullmatch(r"-?\d+|0x[0-9a-fA-F]+", br):
+              line = "CONFIG_%s=%s" % (sym, br)
+          else:
+              line = 'CONFIG_%s="%s"' % (sym, br)
+          with open(dest, "a") as f:
+              f.write(line + "\n")
+          print("Ditambahkan:", line)
+          PYEOF
+          dest=$(cat "$GITHUB_WORKSPACE/kconfig.dest")
+          ok=0
+          for i in $(seq 1 300); do
+            if make -j"$(nproc)" target/linux/compile > "$GITHUB_WORKSPACE/kcompile.log" 2>&1; then
+              ok=1; echo "Kernel selesai dikompilasi (percobaan ke-$i)"; break
+            fi
+            if python3 "$GITHUB_WORKSPACE/resolve_new.py" "$GITHUB_WORKSPACE/kcompile.log" "$dest"; then
+              continue
+            fi
+            echo "Bukan masalah simbol baru. Ekor log:"
+            tail -n 60 "$GITHUB_WORKSPACE/kcompile.log"
+            make -j1 V=s target/linux/compile 2>&1 | tail -n 250
+            exit 1
+          done
+          [ "$ok" = 1 ] || { echo "Terlalu banyak iterasi"; exit 1; }
 
       - name: Build penuh
         working-directory: openwrt
@@ -266,6 +301,7 @@ jobs:
             verify-report.txt
             kernel-final.config
             oldconfig.log
+            kcompile.log
             openwrt/target/linux/armsr/armv8/config-*
             openwrt/target/linux/armsr/config-*
 
@@ -278,4 +314,17 @@ jobs:
           path: |
             openwrt/bin/packages
             openwrt/bin/targets/armsr/armv8/packages
-            
+
+      - name: Simpan cache dl/ (selalu)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ inputs.openwrt_ref }}-${{ github.run_id }}
+
+      - name: Simpan cache ccache (selalu)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.openwrt_ref }}-${{ github.run_id }}
